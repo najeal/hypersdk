@@ -9,6 +9,7 @@ if ! [[ "$0" =~ scripts/tests.unit.sh ]]; then
   exit 255
 fi
 
+
 # shellcheck source=/scripts/common/utils.sh
 source ../../scripts/common/utils.sh
 # shellcheck source=/scripts/constants.sh
