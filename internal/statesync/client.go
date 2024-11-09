@@ -1,15 +1,15 @@
 // Copyright (C) 2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-package vm
+package statesync
 
 import (
 	"context"
 	"errors"
 	"sync"
 
-	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
+	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
@@ -19,10 +19,13 @@ import (
 	avasync "github.com/ava-labs/avalanchego/x/sync"
 )
 
-type stateSyncerClient struct {
-	vm          *VM
-	gatherer    avametrics.MultiGatherer
-	syncManager *avasync.Manager
+type StateSyncerClient struct {
+	vm                   StateSyncClientVM
+	gatherer             avametrics.MultiGatherer
+	logger               logging.Logger
+	syncManager          *avasync.Manager
+	rangeProofHandlerID  uint64
+	changeProofHandlerID uint64
 
 	// tracks the sync target so we can update last accepted
 	// block when sync completes.
@@ -38,41 +41,27 @@ type stateSyncerClient struct {
 }
 
 // TODO: break out into own package
-func (vm *VM) NewStateSyncClient(
+func NewStateSyncClient(
+	vm StateSyncClientVM,
 	gatherer avametrics.MultiGatherer,
-) *stateSyncerClient {
-	return &stateSyncerClient{
-		vm:       vm,
-		gatherer: gatherer,
-		done:     make(chan struct{}),
+	rangeProofHandlerID uint64,
+	changeProofHandlerID uint64,
+) *StateSyncerClient {
+	return &StateSyncerClient{
+		vm:                   vm,
+		gatherer:             gatherer,
+		rangeProofHandlerID:  rangeProofHandlerID,
+		changeProofHandlerID: changeProofHandlerID,
+		done:                 make(chan struct{}),
 	}
 }
 
-func (*stateSyncerClient) StateSyncEnabled(context.Context) (bool, error) {
-	// We always start the state syncer and may fallback to normal bootstrapping
-	// if we are close to tip.
-	//
-	// There is no way to trigger a full bootstrap from genesis.
-	return true, nil
-}
-
-func (*stateSyncerClient) GetOngoingSyncStateSummary(
-	context.Context,
-) (block.StateSummary, error) {
-	// Because the history of MerkleDB change proofs tends to be short, we always
-	// restart syncing from scratch.
-	//
-	// This is unlike other DB implementations where roots are persisted
-	// indefinitely (and it means we can continue from where we left off).
-	return nil, database.ErrNotFound
-}
-
-func (s *stateSyncerClient) AcceptedSyncableBlock(
+func (s *StateSyncerClient) AcceptedSyncableBlock(
 	_ context.Context,
 	sb *chain.SyncableBlock,
 ) (block.StateSyncMode, error) {
 	s.init = true
-	s.vm.snowCtx.Log.Info("accepted syncable block",
+	s.logger.Info("accepted syncable block",
 		zap.Uint64("height", sb.Height()),
 		zap.Stringer("blockID", sb.ID()),
 	)
@@ -80,13 +69,13 @@ func (s *stateSyncerClient) AcceptedSyncableBlock(
 	// If we did not finish syncing, we must state sync.
 	syncing, err := s.vm.GetDiskIsSyncing()
 	if err != nil {
-		s.vm.snowCtx.Log.Warn("could not determine if syncing", zap.Error(err))
+		s.logger.Warn("could not determine if syncing", zap.Error(err))
 		return block.StateSyncSkipped, err
 	}
-	if !syncing && (s.vm.lastAccepted.Hght+s.vm.config.StateSyncMinBlocks > sb.Height()) {
-		s.vm.snowCtx.Log.Info(
+	if !syncing && (s.vm.LastAcceptedBlock().Hght+s.vm.GetStateSyncMinBlocks() > sb.Height()) {
+		s.logger.Info(
 			"bypassing state sync",
-			zap.Uint64("lastAccepted", s.vm.lastAccepted.Hght),
+			zap.Uint64("lastAccepted", s.vm.LastAcceptedBlock().Hght),
 			zap.Uint64("syncableHeight", sb.Height()),
 		)
 		s.startedSync = true
@@ -111,7 +100,7 @@ func (s *stateSyncerClient) AcceptedSyncableBlock(
 	// MerkleDB will handle clearing any keys on-disk that are no
 	// longer necessary.
 	s.target = sb.StatefulBlock
-	s.vm.snowCtx.Log.Info(
+	s.logger.Info(
 		"starting state sync",
 		zap.Uint64("height", s.target.Hght),
 		zap.Stringer("summary", sb),
@@ -125,13 +114,17 @@ func (s *stateSyncerClient) AcceptedSyncableBlock(
 		return block.StateSyncSkipped, err
 	}
 
+	stateDB, err := s.vm.State()
+	if err != nil {
+		return block.StateSyncSkipped, err
+	}
 	s.syncManager, err = avasync.NewManager(avasync.ManagerConfig{
-		BranchFactor:          s.vm.genesis.GetStateBranchFactor(),
-		DB:                    s.vm.stateDB,
-		RangeProofClient:      s.vm.network.NewClient(rangeProofHandlerID),
-		ChangeProofClient:     s.vm.network.NewClient(changeProofHandlerID),
-		SimultaneousWorkLimit: s.vm.config.StateSyncParallelism,
-		Log:                   s.vm.snowCtx.Log,
+		BranchFactor:          s.vm.Genesis().GetStateBranchFactor(),
+		DB:                    stateDB,
+		RangeProofClient:      s.vm.NewNetworkClient(s.rangeProofHandlerID),
+		ChangeProofClient:     s.vm.NewNetworkClient(s.changeProofHandlerID),
+		SimultaneousWorkLimit: s.vm.GetStateSyncParallelism(),
+		Log:                   s.logger,
 		TargetRoot:            sb.StateRoot,
 	}, r)
 	if err != nil {
@@ -158,7 +151,7 @@ func (s *stateSyncerClient) AcceptedSyncableBlock(
 
 	// Kickoff state syncing from [s.target]
 	if err := s.syncManager.Start(context.Background()); err != nil {
-		s.vm.snowCtx.Log.Warn("not starting state syncing", zap.Error(err))
+		s.logger.Warn("not starting state syncing", zap.Error(err))
 		return block.StateSyncSkipped, err
 	}
 	go func() {
@@ -167,7 +160,7 @@ func (s *stateSyncerClient) AcceptedSyncableBlock(
 		// [syncManager] guarantees this will always return so it isn't possible to
 		// deadlock.
 		s.stateSyncErr = s.syncManager.Wait(context.Background())
-		s.vm.snowCtx.Log.Info("state sync done", zap.Error(s.stateSyncErr))
+		s.logger.Info("state sync done", zap.Error(s.stateSyncErr))
 		if s.stateSyncErr == nil {
 			// if the sync was successful, update the last accepted pointers.
 			s.stateSyncErr = s.finishSync()
@@ -187,7 +180,7 @@ func (s *stateSyncerClient) AcceptedSyncableBlock(
 }
 
 // finishSync is responsible for updating disk and memory pointers
-func (s *stateSyncerClient) finishSync() error {
+func (s *StateSyncerClient) finishSync() error {
 	if s.targetUpdated {
 		// Will look like block on start accepted then last block before beginning
 		// bootstrapping is accepted.
@@ -199,14 +192,14 @@ func (s *stateSyncerClient) finishSync() error {
 	return s.vm.PutDiskIsSyncing(false)
 }
 
-func (s *stateSyncerClient) Started() bool {
+func (s *StateSyncerClient) Started() bool {
 	return s.startedSync
 }
 
 // ForceDone is used by the [VM] to skip the sync process or to close the
 // channel if the sync process never started (i.e. [AcceptedSyncableBlock] will
 // never be called)
-func (s *stateSyncerClient) ForceDone() {
+func (s *StateSyncerClient) ForceDone() {
 	if s.startedSync {
 		// If we started sync, we must wait for it to finish
 		return
@@ -217,7 +210,7 @@ func (s *stateSyncerClient) ForceDone() {
 }
 
 // Shutdown can be called to abort an ongoing sync.
-func (s *stateSyncerClient) Shutdown() error {
+func (s *StateSyncerClient) Shutdown() error {
 	if s.syncManager != nil {
 		s.syncManager.Close()
 		<-s.done // wait for goroutine to exit
@@ -226,9 +219,9 @@ func (s *stateSyncerClient) Shutdown() error {
 }
 
 // Error returns a non-nil error if one occurred during the sync.
-func (s *stateSyncerClient) Error() error { return s.stateSyncErr }
+func (s *StateSyncerClient) Error() error { return s.stateSyncErr }
 
-func (s *stateSyncerClient) StateReady() bool {
+func (s *StateSyncerClient) StateReady() bool {
 	select {
 	case <-s.done:
 		return true
@@ -245,7 +238,7 @@ func (s *stateSyncerClient) StateReady() bool {
 
 // UpdateSyncTarget returns a boolean indicating if the root was
 // updated and an error if one occurred while updating the root.
-func (s *stateSyncerClient) UpdateSyncTarget(b *chain.StatefulBlock) (bool, error) {
+func (s *StateSyncerClient) UpdateSyncTarget(b *chain.StatefulBlock) (bool, error) {
 	err := s.syncManager.UpdateSyncTarget(b.StateRoot)
 	if errors.Is(err, avasync.ErrAlreadyClosed) {
 		<-s.done          // Wait for goroutine to exit for consistent return values with IsSyncing
@@ -257,4 +250,8 @@ func (s *stateSyncerClient) UpdateSyncTarget(b *chain.StatefulBlock) (bool, erro
 	s.target = b           // Remember the new target
 	s.targetUpdated = true // Set [targetUpdated] so we call SetLastAccepted on finish
 	return true, nil       // Sync root target updated successfully
+}
+
+func (s *StateSyncerClient) Done() chan struct{} {
+	return s.done
 }

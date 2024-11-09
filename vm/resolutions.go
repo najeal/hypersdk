@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/network/p2p"
+	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
 	"github.com/ava-labs/avalanchego/snow/validators"
@@ -73,6 +75,10 @@ func (vm *VM) Tracer() trace.Tracer {
 
 func (vm *VM) Logger() logging.Logger {
 	return vm.snowCtx.Log
+}
+
+func (vm *VM) SnowCtx() *snow.Context {
+	return vm.snowCtx
 }
 
 func (vm *VM) Rules(t int64) chain.Rules {
@@ -371,14 +377,6 @@ func (vm *VM) UpdateSyncTarget(b *chain.StatefulBlock) (bool, error) {
 	return vm.stateSyncClient.UpdateSyncTarget(b)
 }
 
-func (vm *VM) GetOngoingSyncStateSummary(ctx context.Context) (block.StateSummary, error) {
-	return vm.stateSyncClient.GetOngoingSyncStateSummary(ctx)
-}
-
-func (vm *VM) StateSyncEnabled(ctx context.Context) (bool, error) {
-	return vm.stateSyncClient.StateSyncEnabled(ctx)
-}
-
 func (vm *VM) Genesis() genesis.Genesis {
 	return vm.genesis
 }
@@ -487,6 +485,14 @@ func (vm *VM) GetStateFetchConcurrency() int {
 	return vm.config.StateFetchConcurrency
 }
 
+func (vm *VM) GetStateSyncMinBlocks() uint64 {
+	return vm.config.StateSyncMinBlocks
+}
+
+func (vm *VM) GetStateSyncParallelism() int {
+	return vm.config.StateSyncParallelism
+}
+
 func (vm *VM) GetExecutorBuildRecorder() executor.Metrics {
 	return vm.metrics.executorBuildRecorder
 }
@@ -501,4 +507,8 @@ func (vm *VM) GetDataDir() string {
 
 func (vm *VM) GetGenesisBytes() []byte {
 	return vm.GenesisBytes
+}
+
+func (vm *VM) NewNetworkClient(handlerID uint64, options ...p2p.ClientOption) *p2p.Client {
+	return vm.network.NewClient(handlerID, options...)
 }

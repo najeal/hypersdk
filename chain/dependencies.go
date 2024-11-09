@@ -63,6 +63,7 @@ type VM interface {
 	IsBootstrapped() bool
 	LastAcceptedBlock() *StatefulBlock
 	GetStatefulBlock(context.Context, ids.ID) (*StatefulBlock, error)
+	GetBlockIDAtHeight(_ context.Context, height uint64) (ids.ID, error)
 
 	State() (merkledb.MerkleDB, error)
 	BalanceHandler() BalanceHandler

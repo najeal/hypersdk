@@ -19,6 +19,7 @@ import (
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
+	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
 	"github.com/ava-labs/avalanchego/utils/crypto/bls"
 	"github.com/ava-labs/avalanchego/utils/profiler"
 	"github.com/ava-labs/avalanchego/utils/set"
@@ -39,6 +40,7 @@ import (
 	"github.com/ava-labs/hypersdk/internal/gossiper"
 	"github.com/ava-labs/hypersdk/internal/mempool"
 	"github.com/ava-labs/hypersdk/internal/pebble"
+	"github.com/ava-labs/hypersdk/internal/statesync"
 	"github.com/ava-labs/hypersdk/internal/trace"
 	"github.com/ava-labs/hypersdk/internal/validators"
 	"github.com/ava-labs/hypersdk/internal/workers"
@@ -49,7 +51,6 @@ import (
 	avacache "github.com/ava-labs/avalanchego/cache"
 	avatrace "github.com/ava-labs/avalanchego/trace"
 	avautils "github.com/ava-labs/avalanchego/utils"
-	avasync "github.com/ava-labs/avalanchego/x/sync"
 	internalfees "github.com/ava-labs/hypersdk/internal/fees"
 )
 
@@ -67,6 +68,8 @@ const (
 )
 
 type VM struct {
+	block.StateSyncableVM
+
 	DataDir string
 	v       *version.Semantic
 
@@ -139,7 +142,7 @@ type VM struct {
 	toEngine     chan<- common.Message
 
 	// State Sync client and AppRequest handlers
-	stateSyncClient *stateSyncerClient
+	stateSyncClient *statesync.StateSyncerClient
 
 	metrics  *Metrics
 	profiler profiler.ContinuousProfiler
@@ -195,6 +198,7 @@ func (vm *VM) Initialize(
 ) error {
 	vm.DataDir = filepath.Join(snowCtx.ChainDataDir, vmDataDir)
 	vm.snowCtx = snowCtx
+	vm.StateSyncableVM = statesync.NewStateSyncServer(vm, vm.snowCtx.Log)
 	vm.pkBytes = bls.PublicKeyToCompressedBytes(vm.snowCtx.PublicKey)
 	// This will be overwritten when we accept the first block (in state sync) or
 	// backfill existing blocks (during normal bootstrapping).
@@ -435,26 +439,9 @@ func (vm *VM) Initialize(
 	go vm.processAcceptedBlocks()
 
 	// Setup state syncing
-	vm.stateSyncClient = vm.NewStateSyncClient(vm.snowCtx.Metrics)
+	vm.stateSyncClient = statesync.NewStateSyncClient(vm, vm.snowCtx.Metrics, rangeProofHandlerID, changeProofHandlerID)
 
-	if err := vm.network.AddHandler(
-		rangeProofHandlerID,
-		avasync.NewGetRangeProofHandler(vm.snowCtx.Log, vm.stateDB),
-	); err != nil {
-		return err
-	}
-
-	if err := vm.network.AddHandler(
-		changeProofHandlerID,
-		avasync.NewGetChangeProofHandler(vm.snowCtx.Log, vm.stateDB),
-	); err != nil {
-		return err
-	}
-
-	if err := vm.network.AddHandler(
-		txGossipHandlerID,
-		NewTxGossipHandler(vm),
-	); err != nil {
+	if err := registerStatic(vm); err != nil {
 		return err
 	}
 
@@ -527,7 +514,7 @@ func (vm *VM) markReady() {
 	select {
 	case <-vm.stop:
 		return
-	case <-vm.stateSyncClient.done:
+	case <-vm.stateSyncClient.Done():
 	}
 
 	// We can begin partailly verifying blocks here because
